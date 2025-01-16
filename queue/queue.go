@@ -4,10 +4,14 @@ import (
 	"net/url"
 	"sync"
 
+	whatwgUrl "github.com/nlnwa/whatwg-url/url"
+
 	"github.com/gocolly/colly/v2"
 )
 
 const stop = true
+
+var urlParser = whatwgUrl.NewParser(whatwgUrl.WithPercentEncodeSinglePercentSign())
 
 // Storage is the interface of the queue's storage backend
 // Storage must be concurrently safe for multiple goroutines.
@@ -30,7 +34,8 @@ type Queue struct {
 	Threads int
 	storage Storage
 	wake    chan struct{}
-	mut     sync.Mutex // guards wake
+	mut     sync.Mutex // guards wake and running
+	running bool
 }
 
 // InMemoryQueueStorage is the default implementation of the Storage interface.
@@ -62,6 +67,7 @@ func New(threads int, s Storage) (*Queue, error) {
 	return &Queue{
 		Threads: threads,
 		storage: s,
+		running: true,
 	}, nil
 }
 
@@ -73,12 +79,16 @@ func (q *Queue) IsEmpty() bool {
 
 // AddURL adds a new URL to the queue
 func (q *Queue) AddURL(URL string) error {
-	u, err := url.Parse(URL)
+	u, err := urlParser.Parse(URL)
+	if err != nil {
+		return err
+	}
+	u2, err := url.Parse(u.Href(false))
 	if err != nil {
 		return err
 	}
 	r := &colly.Request{
-		URL:    u,
+		URL:    u2,
 		Method: "GET",
 	}
 	d, err := r.Marshal()
@@ -122,11 +132,12 @@ func (q *Queue) Size() (int, error) {
 // The given Storage must not be used directly while Run blocks.
 func (q *Queue) Run(c *colly.Collector) error {
 	q.mut.Lock()
-	if q.wake != nil {
+	if q.wake != nil && q.running == true {
 		q.mut.Unlock()
 		panic("cannot call duplicate Queue.Run")
 	}
 	q.wake = make(chan struct{})
+	q.running = true
 	q.mut.Unlock()
 
 	requestc := make(chan *colly.Request)
@@ -139,6 +150,13 @@ func (q *Queue) Run(c *colly.Collector) error {
 	return <-errc
 }
 
+// Stop will stop the running queue
+func (q *Queue) Stop() {
+	q.mut.Lock()
+	q.running = false
+	q.mut.Unlock()
+}
+
 func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complete <-chan struct{}, errc chan<- error) {
 	var active int
 	for {
@@ -147,10 +165,10 @@ func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complet
 			errc <- err
 			break
 		}
-		if size == 0 && active == 0 {
+		if size == 0 && active == 0 || !q.running {
 			// Terminate when
 			//   1. No active requests
-			//   2. Emtpy queue
+			//   2. Empty queue
 			errc <- nil
 			break
 		}
